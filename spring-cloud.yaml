@@ -1,0 +1,639 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spring-petclinic
+
+---
+
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: mysql-pv-volume
+  namespace: spring-petclinic
+provisioner: file.csi.azure.com
+allowVolumeExpansion: true
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+mountOptions:
+  - dir_mode=0777
+  - file_mode=0777
+  - uid=0
+  - gid=0
+  - mfsymlinks
+  - cache=strict 
+  - nosharesock
+  - actimeo=30 
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pv-claim
+  namespace: spring-petclinic
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: azurefile-csi
+  resources:
+    requests:
+      storage: 250Mi
+      
+---
+      
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-secret
+  namespace: spring-petclinic
+type: Opaque
+data:
+  mysql-username: cGV0dXNlcg==
+  mysql-password: cGV0Y2xpbmlj
+  mysql-root-password: cGV0Y2xpbmlj
+  
+---
+kind: ConfigMap
+apiVersion: v1
+metadata:
+  name: petclinic-config
+  namespace: spring-petclinic
+data:
+  #database
+  mysql-database: service_instance_db
+  mysql-connection-str: "jdbc:mysql://mysql:3306/service_instance_db?queryInterceptors=brave.mysql8.TracingQueryInterceptor&exceptionInterceptors=brave.mysql8.TracingExceptionInterceptor&zipkinServiceName=customers-db"
+
+  application.yaml: |-
+    server:
+      shutdown: graceful
+      lifecycle:
+        timeout-per-shutdown-phase: 15
+      port: 8080
+      compression:
+        enabled: true
+        mime-types: application/json,text/css,application/javascript
+        min-response-size: 2048
+
+    wavefront:
+      application:
+        name: spring-petclinic-k8s
+      freemium-account: true
+
+    # Logging
+    logging.level.org.springframework: INFO
+
+    # Metrics
+    management:
+      endpoint:
+        health:
+          probes:
+            enabled: true
+      health:
+        livenessState:
+          enabled: true
+        readinessState:
+          enabled: true
+        restart:
+          enabled: true
+        metrics:
+          enabled: true
+        prometheus:
+          enabled: true
+      endpoints:
+        web:
+          exposure:
+            include: '*'
+      metrics:
+        export:
+          prometheus:
+            enabled: true
+          wavefront:
+            enabled: true
+
+    customers-service-id: http://customers-service.spring-petclinic.svc.cluster.local:8080
+    visits-service-id: http://vists-service.spring-petclinic.svc.cluster.local:8080
+
+    spring:
+      datasource:
+        schema: classpath*:db/mysql/schema.sql
+        data: classpath*:db/mysql/data.sql
+        platform: mysql
+        initialization-mode: always
+
+      jpa:
+        show-sql: true
+        hibernate:
+          ddl-auto: none
+          generate-ddl: false
+      sleuth:
+        sampler:
+          probability: 1.0
+        config:
+          # Allow the microservices to override the remote properties with their own System properties or config file
+          allow-override: true
+          # Override configuration with any local property source
+          override-none: true
+      messages:
+        basename: messages/messages
+      cloud:
+        kubernetes:
+          discovery:
+            enabled: true
+        loadbalancer:
+          ribbon:
+            enabled: false
+        gateway:
+          x-forwarded:  
+            enabled: true 
+            for-enabled: true 
+            proto-enabled: true 
+            host-append: false  
+            port-append: false  
+            proto-append: false
+          routes:
+            - id: vets-service
+              uri: http://vets-service.spring-petclinic.svc.cluster.local:8080
+              predicates:
+                - Path=/api/vet/**
+              filters:
+                - StripPrefix=2
+            - id: visits-service
+              uri: http://visits-service.spring-petclinic.svc.cluster.local:8080
+              predicates:
+                - Path=/api/visit/**
+              filters:
+                - StripPrefix=2
+            - id: customers-service
+              uri: http://customers-service.spring-petclinic.svc.cluster.local:8080
+              predicates:
+                - Path=/api/customer/**
+              filters:
+                - StripPrefix=2
+    vets:
+      cache:
+        ttl: 60
+        heap-size: 101
+
+---
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  namespace: spring-petclinic
+  name: namespace-reader
+rules:
+  - apiGroups: ["", "extensions", "apps"]
+    resources: ["configmaps", "pods", "services", "endpoints", "secrets"]
+    verbs: ["get", "list", "watch"]
+
+---
+
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: namespace-reader-binding
+  namespace: spring-petclinic
+subjects:
+- kind: ServiceAccount
+  name: default
+  apiGroup: ""
+roleRef:
+  kind: Role
+  name: namespace-reader
+  apiGroup: ""
+  
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: api-gateway
+  name: api-gateway
+  namespace: spring-petclinic
+spec:
+  ports:
+  - name: "http"
+    port: 80
+    targetPort: 8080
+  selector:
+    app: api-gateway
+  type: LoadBalancer
+status:
+  loadBalancer: {}
+
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: customers-service
+  name: customers-service
+  namespace: spring-petclinic
+spec:
+  ports:
+  - name: "http"
+    port: 8080
+    # appProtocol: "http"
+    targetPort: 8080
+  selector:
+    app: customers-service
+status:
+  loadBalancer: {} 
+  
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: vets-service
+  name: vets-service
+  namespace: spring-petclinic
+spec:
+  ports:
+  - name: "http"
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: vets-service
+status:
+  loadBalancer: {}
+  
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: visits-service
+  name: visits-service
+  namespace: spring-petclinic  
+spec:
+  ports:
+  - name: "http"
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: visits-service
+status:
+  loadBalancer: {}
+  
+---
+
+
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql
+  namespace: spring-petclinic
+spec:
+  ports:
+  - port: 3306
+    targetPort: 3306
+  selector:
+    app: mysql
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql
+  namespace: spring-petclinic
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mysql
+    spec:
+      containers:
+      - image: mysql:5.6
+        name: mysql
+        env: 
+          - 
+            name: MYSQL_DATABASE
+            valueFrom: 
+              configMapKeyRef: 
+                key: mysql-database
+                name: petclinic-config
+          - 
+            name: MYSQL_USER
+            valueFrom: 
+              secretKeyRef: 
+                key: mysql-username
+                name: mysql-secret
+          - 
+            name: MYSQL_PASSWORD
+            valueFrom: 
+              secretKeyRef: 
+                key: mysql-password
+                name: mysql-secret
+          - 
+            name: MYSQL_ROOT_PASSWORD
+            valueFrom: 
+              secretKeyRef: 
+                key: mysql-root-password
+                name: mysql-secret
+        ports:
+        - containerPort: 3306
+          name: mysql
+        volumeMounts:
+        - name: mysql-persistent-storage
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: mysql-persistent-storage
+        persistentVolumeClaim:
+          claimName: mysql-pv-claim
+
+---
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: api-gateway
+  name: api-gateway
+  namespace: spring-petclinic
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: api-gateway
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - api-gateway
+              topologyKey: topology.springpetclinic/zone
+      containers:
+      - image: springcommunity/spring-petclinic-cloud-api-gateway:latest
+        name: api-gateway
+        imagePullPolicy: Always
+        livenessProbe:
+          httpGet:
+            port: 8080
+            path: /actuator/health/liveness
+          initialDelaySeconds: 90
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            port: 8080
+            path: /actuator/health/readiness
+          initialDelaySeconds: 15
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 10"]
+        resources:
+          limits:
+            memory: 1Gi
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: kubernetes
+        ports:
+        - containerPort: 8080
+      restartPolicy: Always
+status: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  annotations:
+  labels:
+    app: customers-service
+  name: customers-service
+  namespace: spring-petclinic
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: customers-service
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: customers-service
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - customers-service
+              topologyKey: topology.springpetclinic/zone
+      containers:
+      - image: springcommunity/spring-petclinic-cloud-customers-service:latest
+        name: customers-service
+        imagePullPolicy: Always
+        livenessProbe:
+          httpGet:
+            port: 8080
+            path: /actuator/health/liveness
+          initialDelaySeconds: 90
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            port: 8080
+            path: /actuator/health/readiness
+          initialDelaySeconds: 15
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 10"]
+        resources:
+          limits:
+            memory: 1Gi
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: kubernetes
+        - name: SPRING_DATASOURCE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-connection-str
+        - name: MYSQL_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-database
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-username
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+
+        ports:
+        - containerPort: 8080
+        resources: {}
+      restartPolicy: Always
+status: {}
+
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: vets-service
+  name: vets-service
+  namespace: spring-petclinic
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vets-service
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: vets-service
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - vets-service
+              topologyKey: topology.springpetclinic/zone
+      containers:
+      - image: springcommunity/spring-petclinic-cloud-vets-service:latest
+        name: vets-service
+        imagePullPolicy: Always
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 10"]
+        resources:
+          limits:
+            memory: 1Gi
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: kubernetes
+        - name: SPRING_DATASOURCE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-connection-str
+        - name: MYSQL_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-database
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-username
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        ports:
+        - containerPort: 8080
+        resources: {}
+      restartPolicy: Always
+status: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: visits-service
+  name: visits-service
+  namespace: spring-petclinic
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: visits-service
+  strategy: {}
+  template:
+    metadata:
+      labels:
+        app: visits-service
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 10
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - visits-service
+              topologyKey: topology.springpetclinic/zone
+      containers:
+      - image: springcommunity/spring-petclinic-cloud-visits-service:latest
+        name: visits-service
+        imagePullPolicy: Always
+        lifecycle:
+          preStop:
+            exec:
+              command: ["sh", "-c", "sleep 10"]
+        resources:
+          limits:
+            memory: 1Gi
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: kubernetes
+        - name: SPRING_DATASOURCE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-connection-str
+        - name: MYSQL_DATABASE
+          valueFrom:
+            configMapKeyRef:
+              name: petclinic-config
+              key: mysql-database
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-username
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom: 
+            secretKeyRef:
+              name: mysql-secret
+              key: mysql-password
+        ports:
+        - containerPort: 8080
+        resources: {}
+      restartPolicy: Always
+status: {}
